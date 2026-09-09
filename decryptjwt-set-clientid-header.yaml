@@ -1,0 +1,193 @@
+global-policy: 1.0.0
+info:
+  name: decryptjwt-set-clientid-header-global-policy
+  title: decryptjwt-set-clientid-header-global-policy
+  version: 1.0.0
+  mode: full-custom
+gateways:
+  - datapower-api-gateway
+assembly:
+  execute:
+    - cors:
+        version: 2.0.0
+        title: cors-in-preflow
+    - gatewayscript:
+        version: 2.0.0
+        title: gatewayscript
+        source: >
+            /**
+            * decryptjwt-set-clientid-header.js
+            * DataPower API Gateway - api-native-code
+            *
+            * If the Authorization header is present and populated, extracts the client_id
+            * claim from the token and sets it as the client_id message header
+            * (context.message.headers.client_id).
+            *
+            * Supports two token types:
+            *   JWE (RSA-OAEP-256 / A128CBC-HS256, cty:JWT) — decrypts using
+            *       DataPower Crypto Key object "crypto_key_wf_jwtdecrypt", then
+            *       extracts claims from the inner JWS payload without signature verification.
+            *   JWS (signed JWT, RS256) — decodes the payload directly without
+            *       signature verification (expiry is not validated).
+            *
+            * If there is no Authorization header, the script exits silently.
+            */
+
+            var jose = require('jose');
+
+
+            // ── INPUTS
+            ────────────────────────────────────────────────────────────
+
+            // Name of the DataPower Crypto Key object used to decrypt JWE
+            tokens.
+
+            var JWE_DECRYPT_KEY = 'crypto_key_wf_jwtdecrypt';
+
+            //
+            ─────────────────────────────────────────────────────────────────────────────
+
+
+            // Guard: skip entirely if Authorization header is absent or blank.
+
+            var raw = context.request.header.get('Authorization') || '';
+
+            if (!raw.trim()) {
+              return; // nothing to do - continue assembly
+            }
+
+
+            // Strip "Bearer " prefix if present.
+            var token = raw.toLowerCase().startsWith('bearer ')
+              ? raw.slice(7).trim()
+              : raw.trim();
+
+            console.log('**** token ****: ' + token + ' ****');
+
+
+            // Parse the token to determine its type.
+
+            // Wrap in try/catch — jose.parse() throws on a malformed token.
+
+            var parsed;
+
+            try {
+              parsed = jose.parse(token);
+            } catch (e) {
+              console.log('**** token issue — jose.parse failed (token is invalid or malformed): ' + e + ' ****');
+              context.set('jwt.parseError', true);
+              context.message.body.write(JSON.stringify({ error: 'invalid_token', error_description: 'The Authorization token is invalid or malformed.' }));
+              context.message.header.set('Content-Type', 'application/json');
+              context.message.statusCode = '401 Unauthorized';
+              return;
+            }
+
+
+            if (jose.isJWEObject(parsed)) {
+              // ── JWE path ────────────────────────────────────────────────────────────
+              console.log('**** token type ****: JWE ****');
+
+              parsed._key = JWE_DECRYPT_KEY;
+
+              jose.createJWEDecrypter(parsed, 'utf8', function(err) {
+                if (err) console.log('**** JWE constructor cb err ****: ' + err + ' ****');
+              }).decrypt(function(err, plaintextBuffer) {
+                if (err) {
+                  console.log('**** JWE decrypt err ****: ' + err + ' ****');
+                  context.reject('TokenDecryptError', 'Failed to decrypt JWE token: ' + err);
+                  context.message.statusCode = '401 Unauthorized';
+                  return;
+                }
+
+                var plaintext = Buffer.isBuffer(plaintextBuffer)
+                  ? plaintextBuffer.toString('utf8')
+                  : String(plaintextBuffer);
+
+                console.log('**** JWE plaintext ****: ' + plaintext + ' ****');
+                extractAndSetClientId(plaintext);
+              });
+
+            } else if (jose.isJWSObject(parsed)) {
+              // ── JWS path ─────────────────────────────────────────────────────────────
+              // Decode the payload segment directly — no decryption needed.
+              // Signature and expiry are intentionally not validated.
+              console.log('**** token type ****: JWS ****');
+              extractAndSetClientId(token);
+
+            } else {
+              console.log('**** token issue — unknown token type (not JWE or JWS): ' + token + ' ****');
+              context.set('jwt.parseError', true);
+              context.message.body.write(JSON.stringify({ error: 'invalid_token', error_description: 'The Authorization token is invalid or malformed.' }));
+              context.message.header.set('Content-Type', 'application/json');
+              context.message.statusCode = '401 Unauthorized';
+            }
+
+
+            /**
+
+            * Given either a compact JWS string (header.payload.sig) or a plain
+            JSON
+
+            * string, extract the client_id claim and set it on the message
+            header.
+
+            */
+
+            function extractAndSetClientId(input) {
+              var claims;
+              try {
+                var parts = input.split('.');
+                if (parts.length >= 2) {
+                  // Compact JWS — base64url-decode the payload segment (index 1).
+                  var payloadJson = Buffer.from(parts[1], 'base64').toString('utf8');
+                  claims = JSON.parse(payloadJson);
+                } else {
+                  claims = JSON.parse(input);
+                }
+              } catch (e) {
+                console.log('**** token issue — failed to parse token payload claims: ' + e + ' ****');
+                context.set('jwt.parseError', true);
+                context.reject('TokenParseError', 'Failed to parse token payload: ' + e);
+                context.message.statusCode = '400 Bad Request';
+                return;
+              }
+
+              console.log('**** claims ****: ' + JSON.stringify(claims) + ' ****');
+
+              var clientId = claims.client_id;
+              console.log('**** clientId from token ****: ' + clientId + ' ****');
+
+              if (!clientId) {
+                console.log('**** token issue — client_id claim is missing from token payload ****');
+                context.set('jwt.parseError', true);
+                context.reject('ClientIdMissingError', 'client_id claim not present in token');
+                context.message.statusCode = '400 Bad Request';
+                return;
+              }
+              context.set('request.headers.client_id', clientId);
+              console.log('**** request.headers.client_id set ****: ' + clientId + ' ****');
+            }
+    - client-identification:
+        version: 2.0.0
+        title: ci-in-preflow
+  catch:
+    - errors:
+        - UnauthorizedError
+      execute:
+        - gatewayscript:
+            version: 2.0.0
+            title: override-client-id-error
+            source: |
+              var tokenIssue = context.get('jwt.parseError');
+              if (tokenIssue) {
+                console.log('**** 401 — token issue: token could not be parsed or client_id is missing from the token ****');
+              } else {
+                console.log('**** 401 — client_id issue: token was parsed and client_id was set on the header, but client-identification check failed (client_id not registered or not valid) ****');
+              }
+              context.message.body.write(JSON.stringify({
+                httpCode: "401",
+                httpMessage: "Unauthorized",
+                moreInformation: "The client_id used in the token is not valid or the token is not valid."
+              }));
+              context.message.header.set('Content-Type', 'application/json');
+              context.message.statusCode = '401 Unauthorized';
